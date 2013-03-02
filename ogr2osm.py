@@ -576,7 +576,7 @@ def output():
     nodes = [geometry for geometry in geometries if type(geometry) == Point]
     ways = [geometry for geometry in geometries if type(geometry) == Way]
     relations = [geometry for geometry in geometries if type(geometry) == Relation]
-    featuresmap = {feature.geometry : feature for feature in features}
+    featuresmap = dict((feature.geometry, feature) for feature in features)
 
     # Open up the output file with the system default buffering
     with open(options.outputFile, 'w', -1) as f:
