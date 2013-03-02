@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-""" ogr2osm beta
+''' ogr2osm beta
 
 This program takes any vector data understadable by OGR and outputs an OSM file
 with that data.
@@ -24,9 +24,12 @@ latitude-longitude)
 For additional usage information, run ogr2osm.py --help
 
 
+Copyright (c) 2012-2013 Paul Norman
+<penorman@mac.com>
+Released under the MIT license: http://opensource.org/licenses/mit-license.php
 
 Copyright (c) 2012 The University of Vermont
-<andrew.guertin@uvm.edu
+<andrew.guertin@uvm.edu>
 Released under the MIT license: http://opensource.org/licenses/mit-license.php
 
 Based very heavily on code released under the following terms:
@@ -40,25 +43,53 @@ Based very heavily on code released under the following terms:
 #  think this stuff is worth it, you can buy me a beer in return.             #
 ###############################################################################
 
-"""
+'''
 
 
 import sys
 import os
-from optparse import OptionParser
+import optparse
 import logging as l
 l.basicConfig(level=l.DEBUG, format="%(message)s")
-
-from xml.sax.saxutils import escape
 
 from osgeo import ogr
 from osgeo import osr
 
-from SimpleXMLWriter import XMLWriter
+
+'''
+
+See http://lxml.de/tutorial.html for the source of the includes
+
+lxml should be the fastest method
+
+'''
+
+try:
+    from lxml import etree
+    l.debug("running with lxml.etree")
+except ImportError:
+    try:
+        # Python 2.5
+        import xml.etree.ElementTree as etree
+        l.debug("running with ElementTree on Python 2.5+")
+    except ImportError:
+        try:
+            # normal cElementTree install
+            import cElementTree as etree
+            l.debug("running with cElementTree")
+        except ImportError:
+            try:
+                # normal ElementTree install
+                import elementtree.ElementTree as etree
+                l.debug("running with ElementTree")
+            except ImportError:
+                l.error("Failed to import ElementTree from any known place")
+                raise
+
 
 # Setup program usage
 usage = "usage: %prog SRCFILE"
-parser = OptionParser(usage=usage)
+parser = optparse.OptionParser(usage=usage)
 parser.add_option("-t", "--translation", dest="translationMethod",
                   metavar="TRANSLATION",
                   help="Select the attribute-tags translation method. See " +
@@ -77,8 +108,37 @@ parser.add_option("-d", "--debug-tags", dest="debugTags", action="store_true",
                   help="Output the tags for every feature parsed.")
 parser.add_option("-f", "--force", dest="forceOverwrite", action="store_true",
                   help="Force overwrite of output file.")
+
+parser.add_option("--encoding", dest="encoding",
+                  help="Encoding of the source file. If specified, overrides " +
+                  "the default of utf-8", default="utf-8")
+
+parser.add_option("--significant-digits",  dest="significantDigits", type=int,
+                  help="Number of decimal places for coordinates", default=9)
+                  
+parser.add_option("--rounding-digits",  dest="roundingDigits", type=int,
+                  help="Number of decimal places for rounding", default=7)
+
+parser.add_option("--no-memory-copy", dest="noMemoryCopy", action="store_true",
+                    help="Do not make an in-memory working copy")
+                    
 parser.add_option("--no-upload-false", dest="noUploadFalse", action="store_true",
                     help="Omit upload=false from the completed file to surpress JOSM warnings when uploading.")
+
+parser.add_option("--id", dest="id", type=int, default=0,
+                    help="ID to start counting from for the output file. Defaults to 0.")
+
+# Positive IDs can cause big problems if used inappropriately so hide the help for this
+parser.add_option("--positive-id", dest="positiveID", action="store_true",
+                    help=optparse.SUPPRESS_HELP)
+
+# Add version attributes. Again, this can cause big problems so surpress the help
+parser.add_option("--add-version", dest="addVersion", action="store_true",
+                    help=optparse.SUPPRESS_HELP)
+
+# Add timestamp attributes. Again, this can cause big problems so surpress the help
+parser.add_option("--add-timestamp", dest="addTimestamp", action="store_true",
+                    help=optparse.SUPPRESS_HELP)
 
 parser.set_defaults(sourceEPSG=None, sourcePROJ4=None, verbose=False,
                     debugTags=False,
@@ -100,7 +160,10 @@ if len(args) < 1:
 elif len(args) > 1:
     parser.error("you have specified too many arguments, " +
                  "only supply the source filename")
-
+                 
+if options.addTimestamp:
+    from datetime import datetime
+    
 # Input and output file
 # if no output file given, use the basename of the source but with .osm
 sourceFile = os.path.realpath(args[0])
@@ -132,7 +195,7 @@ if options.translationMethod:
         # first check translations in the subdir translations of cwd
         sys.path.insert(0, os.path.join(os.getcwd(), "translations"))
         # then check subdir of script dir
-        sys.path.insert(1, os.path.join(os.path.abspath(__file__), "translations"))
+        sys.path.insert(1, os.path.join(os.path.dirname(__file__), "translations"))
         # (the cwd will also be checked implicityly)
 
     # strip .py if present, as import wants just the module name
@@ -140,12 +203,17 @@ if options.translationMethod:
         options.translationMethod = os.path.basename(root)
 
     try:
-        translations = __import__(options.translationMethod)
-    except:
+        translations = __import__(options.translationMethod, fromlist = [''])
+    except ImportError as e:
         parser.error("Could not load translation method '%s'. Translation "
                "script must be in your current directory, or in the "
                "translations/ subdirectory of your current or ogr2osm.py "
-               "directory.") % (options.translationMethod)
+               "directory. The following directories have been considered: %s"
+               % (options.translationMethod, str(sys.path)))
+    except SyntaxError as e:
+        parser.error("Syntax error in '%s'. Translation script is malformed:\n%s"
+               % (options.translationMethod, e))
+
     l.info("Successfully loaded '%s' translation method ('%s')."
            % (options.translationMethod, os.path.realpath(translations.__file__)))
 else:
@@ -195,10 +263,14 @@ geometries = []
 features = []
 
 # Helper function to get a new ID
-elementIdCounter = 0
+elementIdCounter = options.id
+
 def getNewID():
     global elementIdCounter
-    elementIdCounter -= 1
+    if options.positiveID:
+        elementIdCounter += 1
+    else:
+        elementIdCounter -= 1
     return elementIdCounter
 
 # Classes
@@ -232,7 +304,7 @@ class Way(Geometry):
         Geometry.__init__(self)
         self.points = []
     def replacejwithi(self, i, j):
-        self.points = map(lambda x: i if x == j else x, self.points)
+        self.points = [i if x == j else x for x in self.points]
         j.removeparent(self)
         i.addparent(self)
 
@@ -241,7 +313,7 @@ class Relation(Geometry):
         Geometry.__init__(self)
         self.members = []
     def replacejwithi(self, i, j):
-        self.members = map(lambda x: i if x == j else x, self.members)
+        self.members = [i if x == j else x for x in self.members]
         j.removeparent(self)
         i.addparent(self)
 
@@ -258,13 +330,18 @@ class Feature(object):
         i.addparent(self)
 
 def getFileData(filename):
-    if not os.path.isfile(filename):
+    if not os.path.exists(filename):
         parser.error("the file '%s' does not exist" % (filename))
-    dataSource = ogr.Open(filename, 0)  # 0 means read-only
-    if dataSource is None:
+        
+    fileDataSource = ogr.Open(filename, 0)  # 0 means read-only
+    if fileDataSource is None:
         l.error('OGR failed to open ' + filename + ', format may be unsuported')
         sys.exit(1)
-    return dataSource
+    if options.noMemoryCopy:
+        return fileDataSource
+    else:
+        memoryDataSource = ogr.GetDriverByName('Memory').CopyDataSource(fileDataSource,'memoryCopy')
+        return memoryDataSource
 
 def parseData(dataSource):
     l.debug("Parsing data")
@@ -316,9 +393,13 @@ def getLayerFields(layer):
     return fieldNames
 
 def getFeatureTags(ogrfeature, fieldNames):
+    '''
+    This function builds up a dictionary with the source data attributes and passes them to the filterTags function, returning the result.
+    '''
     tags = {}
     for i in range(len(fieldNames)):
-        tags[fieldNames[i]] = ogrfeature.GetFieldAsString(i)
+        # The field needs to be put into the appropriate encoding and leading or trailing spaces stripped
+        tags[fieldNames[i].decode(options.encoding)] = ogrfeature.GetFieldAsString(i).decode(options.encoding).strip()
     return translations.filterTags(tags)
 
 def parseLayer(layer):
@@ -385,18 +466,26 @@ def parseGeometry(ogrgeometries):
     return returngeometries
             
 def parsePoint(ogrgeometry):
-    x = ogrgeometry.GetX()
-    y = ogrgeometry.GetY()
+    x = int(round(ogrgeometry.GetX() * 10**options.significantDigits))
+    y = int(round(ogrgeometry.GetY() * 10**options.significantDigits))
     geometry = Point(x, y)
     return geometry
 
+linestring_points = {}
 def parseLineString(ogrgeometry):
     geometry = Way()
     # LineString.GetPoint() returns a tuple, so we can't call parsePoint on it
     # and instead have to create the point ourself
+    global linestring_points
     for i in range(ogrgeometry.GetPointCount()):
         (x, y, unused) = ogrgeometry.GetPoint(i)
-        mypoint = Point(x, y)
+        (rx, ry) = (int(round(x*10**options.roundingDigits)), int(round(y*10**options.roundingDigits)))
+        (x, y) = (int(round(x*10**options.significantDigits)), int(round(y*10**options.significantDigits)))
+        if (rx,ry) in linestring_points:
+            mypoint = linestring_points[(rx,ry)]
+        else:
+            mypoint = Point(x, y)
+            linestring_points[(rx,ry)] = mypoint
         geometry.points.append(mypoint)
         mypoint.addparent(geometry)
     return geometry
@@ -429,16 +518,19 @@ def parseCollection(ogrgeometry):
     geometryType = ogrgeometry.GetGeometryType()
     if (geometryType == ogr.wkbMultiPolygon or
         geometryType == ogr.wkbMultiPolygon25D):
-        geometry = Relation()
-        for polygon in range(ogrgeometry.GetGeometryCount()):
-            exterior = parseLineString(ogrgeometry.GetGeometryRef(polygon).GetGeometryRef(0))
-            exterior.addparent(geometry)
-            geometry.members.append((exterior, "outer"))
-            for i in range(1, ogrgeometry.GetGeometryRef(polygon).GetGeometryCount()):
-                interior = parseLineString(ogrgeometry.GetGeometryRef(polygon).GetGeometryRef(i))
-                interior.addparent(geometry)
-                geometry.members.append((interior, "inner"))
-        return [geometry]
+        if ogrgeometry.GetGeometryCount() > 1:
+            geometry = Relation()
+            for polygon in range(ogrgeometry.GetGeometryCount()):
+                exterior = parseLineString(ogrgeometry.GetGeometryRef(polygon).GetGeometryRef(0))
+                exterior.addparent(geometry)
+                geometry.members.append((exterior, "outer"))
+                for i in range(1, ogrgeometry.GetGeometryRef(polygon).GetGeometryCount()):
+                    interior = parseLineString(ogrgeometry.GetGeometryRef(polygon).GetGeometryRef(i))
+                    interior.addparent(geometry)
+                    geometry.members.append((interior, "inner"))
+            return [geometry]
+        else:
+           return [parsePolygon(ogrgeometry.GetGeometryRef(0))]
     elif (geometryType == ogr.wkbMultiLineString or
           geometryType == ogr.wkbMultiLineString25D):
         geometries = []
@@ -462,10 +554,12 @@ def mergePoints():
     l.debug("Making list")
     pointcoords = {}
     for i in points:
-        try:
-            pointcoords[(i.x, i.y)].append(i)
-        except KeyError:
-            pointcoords[(i.x, i.y)] = [i]
+        rx = int(round(i.x * 10**(options.significantDigits-options.roundingDigits)))
+        ry = int(round(i.y * 10**(options.significantDigits-options.roundingDigits)))
+        if (rx, ry) in pointcoords:
+            pointcoords[(rx, ry)].append(i)
+        else:
+            pointcoords[(rx, ry)] = [i]
 
     # Use list to get rid of extras
     l.debug("Checking list")
@@ -484,49 +578,74 @@ def output():
     relations = [geometry for geometry in geometries if type(geometry) == Relation]
     featuresmap = {feature.geometry : feature for feature in features}
 
-    w = XMLWriter(open(options.outputFile, 'w'))
-    if options.noUploadFalse:
-        w.start("osm", version='0.6', generator='uvmogr2osm')
-    else:
-        w.start("osm", version='0.6', generator='uvmogr2osm', upload='false')
+    # Open up the output file with the system default buffering
+    with open(options.outputFile, 'w', -1) as f:
         
-    w.data("\n")
-    for node in nodes:
-        w.start("node", visible="true", id=str(node.id), lat=str(node.y), lon=str(node.x))
-        if node in featuresmap:
-            for (key, value) in featuresmap[node].tags.items():
-                w.element("tag", k=escape(key), v=escape(value))
-                w.data("\n")
-        w.end("node")
-        w.data("\n")
+        if options.noUploadFalse:
+            f.write('<?xml version="1.0"?>\n<osm version="0.6" generator="uvmogr2osm">\n')
+        else:
+            f.write('<?xml version="1.0"?>\n<osm version="0.6" upload="false" generator="uvmogr2osm">\n')
 
-    for way in ways:
-        w.start("way", visible="true", id=str(way.id))
-        w.data("\n")
-        for node in way.points:
-            w.element("nd", ref=str(node.id))
-            w.data("\n")
-        if way in featuresmap:
-            for (key, value) in featuresmap[way].tags.items():
-                w.element("tag", k=escape(key), v=escape(value))
-                w.data("\n")
-        w.end("way")
-        w.data("\n")
-
-    for relation in relations:
-        w.start("relation", visible="true", id=str(relation.id))
-        w.data("\n")
-        for (member, role) in relation.members:
-            w.element("member", type="way", ref=str(member.id), role=escape(role))
-            w.data("\n")
-        if relation in featuresmap:
-            for (key, value) in featuresmap[relation].tags.items():
-                w.element("tag", k=escape(key), v=escape(value))
-                w.data("\n")
-        w.end("relation")
-        w.data("\n")
-
-    w.end("osm")
+        # Build up a dict for optional settings
+        attributes = {}
+        if options.addVersion:
+            attributes.update({'version':'1'})
+            
+        if options.addTimestamp:
+            attributes.update({'timestamp':datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')})
+            
+        for node in nodes:
+            xmlattrs = {'visible':'true','id':str(node.id), 'lat':str(node.y*10**-options.significantDigits), 'lon':str(node.x*10**-options.significantDigits)}
+            xmlattrs.update(attributes)
+            
+            xmlobject = etree.Element('node', xmlattrs)
+            
+            if node in featuresmap:
+                for (key, value) in featuresmap[node].tags.items():
+                    tag = etree.Element('tag', {'k':key, 'v':value})
+                    xmlobject.append(tag)
+                    
+            f.write(etree.tostring(xmlobject))
+            f.write('\n')
+            
+        for way in ways:
+            xmlattrs = {'visible':'true', 'id':str(way.id)}
+            xmlattrs.update(attributes)
+            
+            xmlobject = etree.Element('way', xmlattrs)
+            
+            for node in way.points:
+                nd = etree.Element('nd',{'ref':str(node.id)})
+                xmlobject.append(nd)
+            if way in featuresmap:
+                for (key, value) in featuresmap[way].tags.items():
+                    tag = etree.Element('tag', {'k':key, 'v':value})
+                    xmlobject.append(tag)
+                    
+            f.write(etree.tostring(xmlobject))
+            f.write('\n')
+            
+        for relation in relations:
+            xmlattrs = {'visible':'true', 'id':str(relation.id)}
+            xmlattrs.update(attributes)
+            
+            xmlobject = etree.Element('relation', xmlattrs)
+            
+            for (member, role) in relation.members:
+                member = etree.Element('member', {'type':'way', 'ref':str(member.id), 'role':role})
+                xmlobject.append(member)
+            
+            tag = etree.Element('tag', {'k':'type', 'v':'multipolygon'})
+            xmlobject.append(tag)
+            if relation in featuresmap:
+                for (key, value) in featuresmap[relation].tags.items():
+                    tag = etree.Element('tag', {'k':key, 'v':value})
+                    xmlobject.append(tag)
+                    
+            f.write(etree.tostring(xmlobject))
+            f.write('\n')
+            
+        f.write('</osm>')
 
 
 # Main flow
